@@ -18,21 +18,27 @@ Configuration in config.yaml:
 """
 
 import asyncio
+import inspect
+import json
 import logging
 import os
 import re
 import time
 import uuid
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+from urllib.parse import quote_plus
 
 try:
     import dingtalk_stream
     from dingtalk_stream import ChatbotHandler, ChatbotMessage
+    import websockets
     DINGTALK_STREAM_AVAILABLE = True
 except ImportError:
     DINGTALK_STREAM_AVAILABLE = False
     dingtalk_stream = None  # type: ignore[assignment]
+    websockets = None  # type: ignore[assignment]
 
 try:
     import httpx
@@ -55,7 +61,7 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_LENGTH = 20000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 _SESSION_WEBHOOKS_MAX = 500
-_DINGTALK_WEBHOOK_RE = re.compile(r'^https://api\.dingtalk\.com/')
+_DINGTALK_WEBHOOK_RE = re.compile(r'^https://(?:api|oapi)\.dingtalk\.com/')
 
 
 def check_dingtalk_requirements() -> bool:
@@ -129,12 +135,17 @@ class DingTalkAdapter(BasePlatformAdapter):
             return False
 
     async def _run_stream(self) -> None:
-        """Run the blocking stream client with auto-reconnection."""
+        """Run the stream client with auto-reconnection and graceful shutdown."""
         backoff_idx = 0
         while self._running:
             try:
                 logger.debug("[%s] Starting stream client...", self.name)
-                await asyncio.to_thread(self._stream_client.start)
+                start_method = self._stream_client.start
+                if inspect.iscoroutinefunction(start_method):
+                    await self._run_async_stream_client_once()
+                else:
+                    await asyncio.to_thread(start_method)
+                backoff_idx = 0
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -150,17 +161,52 @@ class DingTalkAdapter(BasePlatformAdapter):
             await asyncio.sleep(delay)
             backoff_idx += 1
 
+    async def _run_async_stream_client_once(self) -> None:
+        """Run one async DingTalk stream connection and return when it closes."""
+        client = self._stream_client
+        client.pre_start()
+
+        connection = await asyncio.to_thread(client.open_connection)
+        if not connection:
+            raise RuntimeError("open connection failed")
+        logger.info("endpoint is %s", connection)
+
+        uri = f'{connection["endpoint"]}?ticket={quote_plus(connection["ticket"])}'
+        async with websockets.connect(uri) as websocket:
+            client.websocket = websocket
+            keepalive_task = asyncio.create_task(client.keepalive(websocket))
+            try:
+                while self._running:
+                    try:
+                        raw_message = await websocket.recv()
+                    except websockets.exceptions.ConnectionClosed:
+                        break
+                    json_message = json.loads(raw_message)
+                    asyncio.create_task(client.background_task(json_message))
+            finally:
+                keepalive_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await keepalive_task
+                client.websocket = None
+
     async def disconnect(self) -> None:
         """Disconnect from DingTalk."""
         self._running = False
         self._mark_disconnected()
 
+        websocket = getattr(self._stream_client, "websocket", None)
+        if websocket is not None:
+            try:
+                await websocket.close()
+            except Exception as e:
+                logger.debug("[%s] websocket close during disconnect failed: %s", self.name, e)
+
         if self._stream_task:
             self._stream_task.cancel()
             try:
-                await self._stream_task
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(self._stream_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                logger.debug("[%s] stream task did not exit cleanly during disconnect", self.name)
             self._stream_task = None
 
         if self._http_client:
@@ -196,6 +242,17 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         chat_id = conversation_id or sender_id
         chat_type = "group" if is_group else "dm"
+
+        logger.info(
+            "[%s] Inbound message message_id=%s chat_type=%s conversation_id=%s sender_id=%s sender_staff_id=%s has_text=%s",
+            self.name,
+            msg_id,
+            chat_type,
+            conversation_id or "-",
+            sender_id or "-",
+            sender_staff_id or "-",
+            bool(text),
+        )
 
         # Store session webhook for reply routing (validate origin to prevent SSRF)
         session_webhook = getattr(message, "session_webhook", None) or ""
@@ -315,19 +372,26 @@ class _IncomingHandler(ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
         self._adapter = adapter
         self._loop = loop
 
-    def process(self, message: "ChatbotMessage"):
-        """Called by dingtalk-stream in its thread when a message arrives.
-
-        Schedules the async handler on the main event loop.
-        """
-        loop = self._loop
-        if loop is None or loop.is_closed():
-            logger.error("[DingTalk] Event loop unavailable, cannot dispatch message")
-            return dingtalk_stream.AckMessage.STATUS_OK, "OK"
-
-        future = asyncio.run_coroutine_threadsafe(self._adapter._on_message(message), loop)
+    async def process(self, message: "ChatbotMessage"):
+        """Called by dingtalk-stream when a message arrives."""
+        logger.info(
+            "[DingTalk] Incoming callback topic=%s callback_type=%s python_type=%s message_id=%s conversation_id=%s sender_id=%s has_text=%s has_data=%s has_headers=%s",
+            getattr(message, "topic", "-"),
+            getattr(message, "type", "-") or "-",
+            type(message).__name__,
+            getattr(message, "message_id", "-") or "-",
+            getattr(message, "conversation_id", "-") or "-",
+            getattr(message, "sender_id", "-") or "-",
+            bool(getattr(message, "text", None)),
+            bool(getattr(message, "data", None)),
+            bool(getattr(message, "headers", None)),
+        )
         try:
-            future.result(timeout=60)
+            incoming_message = message
+            callback_data = getattr(message, "data", None)
+            if isinstance(callback_data, dict) and callback_data:
+                incoming_message = ChatbotMessage.from_dict(callback_data)
+            await self._adapter._on_message(incoming_message)
         except Exception:
             logger.exception("[DingTalk] Error processing incoming message")
 

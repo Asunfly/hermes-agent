@@ -2,6 +2,7 @@
 import asyncio
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 import pytest
@@ -231,6 +232,89 @@ class TestSend:
 class TestConnect:
 
     @pytest.mark.asyncio
+    async def test_disconnect_closes_async_stream_websocket(self, monkeypatch):
+        from gateway.platforms import dingtalk as dingtalk_module
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+
+        class FakeConnectionClosed(Exception):
+            pass
+
+        class FakeWebSocket:
+            def __init__(self):
+                self.closed = asyncio.Event()
+                self.close_calls = 0
+
+            async def recv(self):
+                await self.closed.wait()
+                raise FakeConnectionClosed()
+
+            async def close(self):
+                self.close_calls += 1
+                self.closed.set()
+
+            async def ping(self):
+                return None
+
+        class FakeConnectContext:
+            def __init__(self, websocket):
+                self.websocket = websocket
+
+            async def __aenter__(self):
+                return self.websocket
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeStreamClient:
+            def __init__(self, websocket):
+                self.websocket = None
+                self._websocket = websocket
+                self.pre_start_called = False
+
+            def pre_start(self):
+                self.pre_start_called = True
+
+            def open_connection(self):
+                return {"endpoint": "wss://example.invalid/connect", "ticket": "ticket"}
+
+            async def keepalive(self, websocket):
+                await websocket.closed.wait()
+
+            async def background_task(self, json_message):
+                return None
+
+            async def start(self):
+                while True:
+                    try:
+                        await self._websocket.closed.wait()
+                        return
+                    except asyncio.CancelledError:
+                        continue
+
+        websocket = FakeWebSocket()
+        adapter._stream_client = FakeStreamClient(websocket)
+        adapter._running = True
+
+        fake_websockets = SimpleNamespace(
+            connect=lambda _uri: FakeConnectContext(websocket),
+            exceptions=SimpleNamespace(ConnectionClosed=FakeConnectionClosed),
+        )
+        monkeypatch.setattr(dingtalk_module, "websockets", fake_websockets, raising=False)
+
+        adapter._stream_task = asyncio.create_task(adapter._run_stream())
+        for _ in range(20):
+            if adapter._stream_client.websocket is not None:
+                break
+            await asyncio.sleep(0)
+
+        await asyncio.wait_for(adapter.disconnect(), timeout=0.5)
+
+        assert websocket.close_calls == 1
+        assert adapter._stream_task is None
+
+    @pytest.mark.asyncio
     async def test_connect_fails_without_sdk(self, monkeypatch):
         monkeypatch.setattr(
             "gateway.platforms.dingtalk.DINGTALK_STREAM_AVAILABLE", False
@@ -270,6 +354,165 @@ class TestConnect:
 
 
 class TestPlatformEnum:
+
+    @pytest.mark.asyncio
+    async def test_incoming_handler_process_awaits_adapter_handler(self):
+        from gateway.platforms.dingtalk import _IncomingHandler, dingtalk_stream
+
+        adapter = MagicMock()
+        adapter._on_message = AsyncMock()
+
+        handler = _IncomingHandler(adapter, asyncio.get_running_loop())
+        message = MagicMock()
+        message.data = {"msgId": "msg-1", "conversationId": "conv-1", "senderId": "sender-1", "msgtype": "text", "text": {"content": "hi"}}
+
+        result = await handler.process(message)
+
+        adapter._on_message.assert_awaited_once()
+        forwarded = adapter._on_message.await_args.args[0]
+        assert forwarded.message_id == "msg-1"
+        assert forwarded.conversation_id == "conv-1"
+        assert forwarded.sender_id == "sender-1"
+        assert forwarded.text.content == "hi"
+        assert result == (dingtalk_stream.AckMessage.STATUS_OK, "OK")
+
+    @pytest.mark.asyncio
+    async def test_incoming_handler_logs_topic_metadata(self, caplog):
+        from gateway.platforms import dingtalk as dingtalk_module
+        from gateway.platforms.dingtalk import _IncomingHandler
+
+        adapter = MagicMock()
+        adapter._on_message = AsyncMock()
+
+        handler = _IncomingHandler(adapter, asyncio.get_running_loop())
+        message = MagicMock()
+        message.message_id = "msg-1"
+        message.conversation_id = "conv-1"
+        message.sender_id = "sender-1"
+        message.type = "CALLBACK"
+        message.text = {"content": "hi"}
+        message.data = {"k": "v"}
+        message.headers = {"topic": "chatbot"}
+        type(message).topic = PropertyMock(return_value="chatbot")
+
+        with caplog.at_level("INFO", logger=dingtalk_module.logger.name):
+            await handler.process(message)
+
+        assert "Incoming callback topic=chatbot" in caplog.text
+        assert "callback_type=CALLBACK" in caplog.text
+        assert "conversation_id=conv-1" in caplog.text
+        assert "sender_id=sender-1" in caplog.text
+        assert "has_text=True" in caplog.text
+        assert "has_data=True" in caplog.text
+        assert "has_headers=True" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_on_message_logs_inbound_metadata(self, caplog):
+        from gateway.platforms import dingtalk as dingtalk_module
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+
+        message = MagicMock()
+        message.message_id = "msg-1"
+        message.text = {"content": "hi"}
+        message.rich_text = None
+        message.conversation_id = "conv-1"
+        message.conversation_type = "1"
+        message.sender_id = "sender-1"
+        message.sender_nick = "Alice"
+        message.sender_staff_id = "staff-1"
+        message.conversation_title = "Hermes"
+        message.session_webhook = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+        message.create_at = str(int(datetime.now(tz=timezone.utc).timestamp() * 1000))
+
+        with caplog.at_level("INFO", logger=dingtalk_module.logger.name):
+            await adapter._on_message(message)
+
+        assert "Inbound message message_id=msg-1" in caplog.text
+        assert "chat_type=dm" in caplog.text
+        assert "conversation_id=conv-1" in caplog.text
+        assert "sender_id=sender-1" in caplog.text
+        assert "sender_staff_id=staff-1" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_on_message_caches_legacy_oapi_session_webhook(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+
+        message = MagicMock()
+        message.message_id = "msg-legacy"
+        message.text = {"content": "hi"}
+        message.rich_text = None
+        message.conversation_id = "conv-legacy"
+        message.conversation_type = "1"
+        message.sender_id = "sender-legacy"
+        message.sender_nick = "Alice"
+        message.sender_staff_id = "staff-legacy"
+        message.conversation_title = "Hermes"
+        message.session_webhook = "https://oapi.dingtalk.com/robot/sendBySession?session=abc"
+        message.create_at = str(int(datetime.now(tz=timezone.utc).timestamp() * 1000))
+
+        await adapter._on_message(message)
+
+        assert adapter._session_webhooks["conv-legacy"] == (
+            "https://oapi.dingtalk.com/robot/sendBySession?session=abc"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_dm_sends_pairing_code_via_cached_webhook(self, monkeypatch, tmp_path):
+        import gateway.run as gateway_run
+        from gateway.config import GatewayConfig
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("DINGTALK_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("DINGTALK_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+        (tmp_path / "config.yaml").write_text("", encoding="utf-8")
+
+        runner = GatewayRunner(GatewayConfig())
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter.set_message_handler(runner._handle_message)
+        runner.adapters[Platform.DINGTALK] = adapter
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = "OK"
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        adapter._http_client = mock_client
+
+        message = MagicMock()
+        message.message_id = "msg-auth"
+        message.text = {"content": "hello"}
+        message.rich_text = None
+        message.conversation_id = "conv-auth"
+        message.conversation_type = "1"
+        message.sender_id = "sender-auth"
+        message.sender_nick = "Alice"
+        message.sender_staff_id = "staff-auth"
+        message.conversation_title = "Hermes"
+        message.session_webhook = "https://oapi.dingtalk.com/robot/sendBySession?session=abc"
+        message.create_at = str(int(datetime.now(tz=timezone.utc).timestamp() * 1000))
+
+        await adapter._on_message(message)
+        if adapter._background_tasks:
+            await asyncio.gather(*list(adapter._background_tasks))
+
+        pending = runner.pairing_store.list_pending("dingtalk")
+        assert len(pending) == 1
+        sent_url = mock_client.post.await_args.args[0]
+        sent_payload = mock_client.post.await_args.kwargs["json"]
+        assert sent_url == "https://oapi.dingtalk.com/robot/sendBySession?session=abc"
+        assert pending[0]["code"] in sent_payload["markdown"]["text"]
+        assert "hermes pairing approve dingtalk" in sent_payload["markdown"]["text"]
 
     def test_dingtalk_in_platform_enum(self):
         assert Platform.DINGTALK.value == "dingtalk"
